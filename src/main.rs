@@ -117,7 +117,7 @@ fn cli_init() -> Result<ValidatedArgs> {
     if let Err(e) = log_cfg.set_time_offset_to_local() {
         eprintln!("WARNING: could not set log TZ to local: {e:?}");
     };
-    log_cfg.set_time_format_rfc3339();
+    log_cfg.set_time_format_rfc2822();
     CombinedLogger::init(vec![TermLogger::new(
         log_lvl,
         log_cfg.build(),

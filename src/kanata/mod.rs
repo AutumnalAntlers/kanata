@@ -1021,6 +1021,7 @@ impl Kanata {
                         | SequenceInputMode::HiddenDelayType => {}
                     }
                     log::debug!("sequence got {k:?}");
+                    log::info!("Current sequence: {:?}", state.sequence);
 
                     use kanata_parser::sequences::*;
                     use kanata_parser::trie::GetOrDescendentExistsResult::*;
@@ -1038,6 +1039,7 @@ impl Kanata {
                                 // Can't use iter_mut due to borrowing issues.
                                 state.sequence[i] &= MASK_KEYCODES;
                                 res = self.sequences.get_or_descendant_exists(&state.sequence);
+                                log::info!("Maybe found back-up sequence: {:?}", res);
                                 if res != NotInTrie {
                                     no_valid_seqs = false;
                                     break;

@@ -1487,6 +1487,7 @@ fn parse_action_atom(ac_span: &Spanned<String>, s: &ParserState) -> Result<&'sta
     }
     // Parse a sequence like `C-S-v` or `C-A-del`
     let (mut keys, unparsed_str) = parse_mod_prefix(ac)?;
+    log::info!("Parsing modified atom {:?} {:?} ", keys, unparsed_str);
     keys.push(
         str_to_oscode(unparsed_str)
             .ok_or_else(|| {
@@ -1501,6 +1502,7 @@ fn parse_action_atom(ac_span: &Spanned<String>, s: &ParserState) -> Result<&'sta
             })?
             .into(),
     );
+    log::info!("Parsed modified key-sequence (no magic): {:?}", keys);
     Ok(s.a.sref(Action::MultipleKeyCodes(s.a.sref(s.a.sref_vec(keys)))))
 }
 
@@ -1910,6 +1912,7 @@ fn parse_macro_item_impl<'a>(
             }
         }
     }
+    log::info!("Peeking at parsed action: {:?}", parse_action(&acs[0], s));
     match parse_action(&acs[0], s) {
         Ok(Action::KeyCode(kc)) => {
             // Should note that I tried `SequenceEvent::Tap` initially but it seems to be buggy
@@ -3019,6 +3022,7 @@ fn parse_sequence_keys(exprs: &[SExpr], s: &ParserState) -> Result<Vec<u16>> {
     let mut exprs_remaining = exprs;
     let mut all_keys = Vec::new();
     while !exprs_remaining.is_empty() {
+        log::info!("Remaining expressions: {:?}", exprs_remaining);
         let (mut keys, exprs_remaining_tmp) =
             match parse_macro_item_impl(exprs_remaining, s, MacroNumberParseMode::Action) {
                 Ok(res) => {
@@ -3055,6 +3059,7 @@ fn parse_sequence_keys(exprs: &[SExpr], s: &ParserState) -> Result<Vec<u16>> {
                     while let Some(action) = key_actions.next() {
                         match action {
                             Press(pressed) => {
+                                log::info!("\"Pressed\" action: {:?}", action);
                                 if matches!(key_actions.peek(), Some(Press(..))) {
                                     // press->press: current press is mod
                                     mods_currently_held.push(*pressed);
@@ -3088,9 +3093,11 @@ fn parse_sequence_keys(exprs: &[SExpr], s: &ParserState) -> Result<Vec<u16>> {
                     return Err(e);
                 }
             };
+        log::info!("Adding to sequence: {:?}", keys);
         all_keys.append(&mut keys);
         exprs_remaining = exprs_remaining_tmp;
     }
+    log::info!("Recording full sequence: {:?}", all_keys);
     Ok(all_keys)
 }
 
