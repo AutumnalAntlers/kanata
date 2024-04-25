@@ -982,6 +982,15 @@ impl Kanata {
             // allocations and logic.
             self.prev_keys.push(*k);
             self.last_pressed_key = *k;
+            if self.sequence_state.is_none() {
+                log::debug!("entering sequence mode");
+                self.sequence_state = Some(SequenceState {
+                    sequence: vec![],
+                    sequence_input_mode: SequenceInputMode::VisibleBackspaced,
+                    ticks_until_timeout: 2000 as u16,
+                    sequence_timeout: 2000 as u16,
+                });
+            }
             match &mut self.sequence_state {
                 None => {
                     log::debug!("key press     {:?}", k);
