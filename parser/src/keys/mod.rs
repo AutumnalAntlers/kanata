@@ -340,6 +340,16 @@ pub fn str_to_oscode(s: &str) -> Option<OsCode> {
         "nop7" => OsCode::KEY_683,
         "nop8" => OsCode::KEY_684,
         "nop9" => OsCode::KEY_685,
+        "nop10" => OsCode::KEY_686,
+        "nop11" => OsCode::KEY_687,
+        "nop12" => OsCode::KEY_688,
+        "nop13" => OsCode::KEY_689,
+        "nop14" => OsCode::KEY_690,
+        "nop15" => OsCode::KEY_691,
+        "nop16" => OsCode::KEY_692,
+        "nop17" => OsCode::KEY_693,
+        "nop18" => OsCode::KEY_694,
+        "nop19" => OsCode::KEY_695,
 
         _ => return None,
     })

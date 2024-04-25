@@ -210,7 +210,7 @@ pub struct Kanata {
 // Thus based on my reading, 18 is the highest macro key
 // that can be assumed to be used by devices still in production.
 const KEY_IGNORE_MIN: u16 = 0x2a4; // KEY_MACRO21
-const KEY_IGNORE_MAX: u16 = 0x2ad; // KEY_MACRO30
+const KEY_IGNORE_MAX: u16 = 0x2b8; // KEY_MACRO30
 fn write_key(kb: &mut KbdOut, osc: OsCode, val: KeyValue) -> Result<(), std::io::Error> {
     match u16::from(osc) {
         KEY_IGNORE_MIN..=KEY_IGNORE_MAX => Ok(()),
