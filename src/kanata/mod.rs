@@ -59,6 +59,16 @@ pub use caps_word::*;
 type HashSet<T> = rustc_hash::FxHashSet<T>;
 type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 
+const RIGHT_HAND_KEYS: [OsCode; 7] = [
+    OsCode::KEY_U,
+    OsCode::KEY_I,
+    OsCode::KEY_O,
+    OsCode::KEY_H,
+    OsCode::KEY_J,
+    OsCode::KEY_K,
+    OsCode::KEY_L
+];
+
 pub struct Kanata {
     /// Handle to some OS keyboard output mechanism.
     pub kbd_out: KbdOut,
@@ -98,7 +108,9 @@ pub struct Kanata {
     /// <../../docs/sequence-adding-chords-ideas.md> for more info.
     pub sequence_backtrack_modcancel: bool,
     /// Tracks sequence progress. Is Some(...) when in sequence mode and None otherwise.
-    pub sequence_state: Option<SequenceState>,
+    pub sequence_state_1: Option<SequenceState>,
+    pub sequence_state_2: Option<SequenceState>,
+    pub last_physical_keycode: Option<OsCode>,
     /// Valid sequences defined in the user configuration.
     pub sequences: cfg::KeySeqsToFKeys,
     /// Stores the user recored dynamic macros.
@@ -349,7 +361,9 @@ impl Kanata {
             move_mouse_state_horizontal: None,
             move_mouse_speed_modifiers: Vec::new(),
             sequence_backtrack_modcancel: cfg.options.sequence_backtrack_modcancel,
-            sequence_state: None,
+            sequence_state_1: None,
+            sequence_state_2: None,
+            last_physical_keycode: None,
             sequences: cfg.sequences,
             last_tick: instant::Instant::now(),
             time_remainder: 0,
@@ -439,7 +453,9 @@ impl Kanata {
             move_mouse_state_horizontal: None,
             move_mouse_speed_modifiers: Vec::new(),
             sequence_backtrack_modcancel: cfg.options.sequence_backtrack_modcancel,
-            sequence_state: None,
+            sequence_state_1: None,
+            sequence_state_2: None,
+            last_physical_keycode: None,
             sequences: cfg.sequences,
             last_tick: instant::Instant::now(),
             time_remainder: 0,
@@ -568,6 +584,7 @@ impl Kanata {
         self.ticks_since_idle = 0;
         let kbrn_ev = match event.value {
             KeyValue::Press => {
+                self.last_physical_keycode = Some(event.code);
                 if let Some((macro_id, recorded_macro)) = record_press(
                     &mut self.dynamic_macro_record_state,
                     event.code,
@@ -817,12 +834,20 @@ impl Kanata {
     }
 
     fn tick_sequence_state(&mut self) -> Result<()> {
-        if let Some(state) = &mut self.sequence_state {
+        if let Some(state) = &mut self.sequence_state_1 {
             state.ticks_until_timeout -= 1;
             if state.ticks_until_timeout == 0 {
-                log::debug!("sequence timeout; exiting sequence state");
+                log::debug!("sequence_1 timeout; exiting sequence state");
                 cancel_sequence(state, &mut self.kbd_out)?;
-                self.sequence_state = None;
+                self.sequence_state_1 = None;
+            }
+        }
+        if let Some(state) = &mut self.sequence_state_2 {
+            state.ticks_until_timeout -= 1;
+            if state.ticks_until_timeout == 0 {
+                log::debug!("sequence_2 timeout; exiting sequence state");
+                cancel_sequence(state, &mut self.kbd_out)?;
+                self.sequence_state_2 = None;
             }
         }
         Ok(())
@@ -982,176 +1007,359 @@ impl Kanata {
             // allocations and logic.
             self.prev_keys.push(*k);
             self.last_pressed_key = *k;
-            if self.sequence_state.is_none() {
-                log::debug!("entering sequence mode");
-                self.sequence_state = Some(SequenceState {
+            if self.sequence_state_2.is_none() {
+                log::debug!("entering sequence_2 mode");
+                self.sequence_state_2 = Some(SequenceState {
                     sequence: vec![],
                     sequence_input_mode: SequenceInputMode::VisibleBackspaced,
                     ticks_until_timeout: 2000 as u16,
                     sequence_timeout: 2000 as u16,
                 });
             }
-            match &mut self.sequence_state {
-                None => {
-                    log::debug!("key press     {:?}", k);
-                    if let Err(e) = press_key(&mut self.kbd_out, k.into()) {
-                        bail!("failed to press key: {:?}", e);
-                    }
-                }
-                Some(state) => {
-                    state.ticks_until_timeout = state.sequence_timeout;
-
-                    let osc = OsCode::from(*k);
-
-                    let pushed_into_seq = {
-                        // Transform to OsCode and convert modifiers other than altgr/ralt
-                        // (same key different names) to the left version, since that's
-                        // how chords get transformed when building up sequences.
-                        let mut base = u16::from(match osc {
-                            OsCode::KEY_RIGHTSHIFT => OsCode::KEY_LEFTSHIFT,
-                            OsCode::KEY_RIGHTMETA => OsCode::KEY_LEFTMETA,
-                            OsCode::KEY_RIGHTCTRL => OsCode::KEY_LEFTCTRL,
-                            osc => osc,
-                        });
-                        // Modify the upper unused bits of the u16 to signify that the key
-                        // is activated alongside a modifier.
-                        for k in cur_keys.iter().copied() {
-                            base |= mod_mask_for_keycode(k);
-                        }
-                        base
-                    };
-
-                    state.sequence.push(pushed_into_seq);
-                    match state.sequence_input_mode {
-                        SequenceInputMode::VisibleBackspaced => {
-                            press_key(&mut self.kbd_out, osc)?;
-                        }
-                        SequenceInputMode::HiddenSuppressed
-                        | SequenceInputMode::HiddenDelayType => {}
-                    }
-                    log::debug!("sequence got {k:?}");
-                    log::info!("Current sequence: {:?}", state.sequence);
-
-                    use kanata_parser::sequences::*;
-                    use kanata_parser::trie::GetOrDescendentExistsResult::*;
-
-                    // Check for invalid sequence termination.
-                    let mut res = self.sequences.get_or_descendant_exists(&state.sequence);
-                    if res == NotInTrie {
-                        let is_invalid_termination = if self.sequence_backtrack_modcancel
-                            && (pushed_into_seq & MASK_MODDED > 0)
-                        {
-                            let mut no_valid_seqs = true;
-                            // If applicable, check again with modifier bits unset.
-                            for i in (0..state.sequence.len()).rev() {
-                                // Note: proper bounds are immediately above.
-                                // Can't use iter_mut due to borrowing issues.
-                                state.sequence[i] &= MASK_KEYCODES;
-                                res = self.sequences.get_or_descendant_exists(&state.sequence);
-                                log::info!("Maybe found back-up sequence: {:?}", res);
-                                if res != NotInTrie {
-                                    no_valid_seqs = false;
-                                    break;
-                                }
+            if self.sequence_state_1.is_none() {
+                log::debug!("entering sequence_1 mode");
+                self.sequence_state_1 = Some(SequenceState {
+                    sequence: vec![],
+                    sequence_input_mode: SequenceInputMode::VisibleBackspaced,
+                    ticks_until_timeout: 2000 as u16,
+                    sequence_timeout: 2000 as u16,
+                });
+            }
+            log::debug!("k: {}", OsCode::from(*k) as u16);
+            if OsCode::from(*k) as u16 > 600 as u16 {
+                if RIGHT_HAND_KEYS.contains(&self.last_physical_keycode.unwrap()) {
+                    match &mut self.sequence_state_2 {
+                        None => {
+                            log::debug!("2 key press     {:?}", k);
+                            if let Err(e) = press_key(&mut self.kbd_out, k.into()) {
+                                bail!("2 failed to press key: {:?}", e);
                             }
-                            no_valid_seqs
-                        } else {
-                            true
-                        };
-                        if is_invalid_termination {
-                            log::debug!("got invalid sequence; exiting sequence mode");
+                        }
+                        Some(state) => {
+                            state.ticks_until_timeout = state.sequence_timeout;
+
+                            let osc = OsCode::from(*k);
+
+                            let pushed_into_seq = {
+                                // Transform to OsCode and convert modifiers other than altgr/ralt
+                                // (same key different names) to the left version, since that's
+                                // how chords get transformed when building up sequences.
+                                let mut base = u16::from(match osc {
+                                    OsCode::KEY_RIGHTSHIFT => OsCode::KEY_LEFTSHIFT,
+                                    OsCode::KEY_RIGHTMETA => OsCode::KEY_LEFTMETA,
+                                    OsCode::KEY_RIGHTCTRL => OsCode::KEY_LEFTCTRL,
+                                    osc => osc,
+                                });
+                                // Modify the upper unused bits of the u16 to signify that the key
+                                // is activated alongside a modifier.
+                                for k in cur_keys.iter().copied() {
+                                    base |= mod_mask_for_keycode(k);
+                                }
+                                base
+                            };
+
+                            state.sequence.push(pushed_into_seq);
                             match state.sequence_input_mode {
-                                SequenceInputMode::HiddenDelayType => {
-                                    for code in state.sequence.iter().copied() {
-                                        let code = code & MASK_KEYCODES;
-                                        if let Some(osc) = OsCode::from_u16(code) {
-                                            // BUG: chorded_hidden_delay_type
-                                            press_key(&mut self.kbd_out, osc)?;
-                                            release_key(&mut self.kbd_out, osc)?;
-                                        }
-                                    }
+                                SequenceInputMode::VisibleBackspaced => {
+                                    press_key(&mut self.kbd_out, osc)?;
                                 }
                                 SequenceInputMode::HiddenSuppressed
-                                | SequenceInputMode::VisibleBackspaced => {}
+                                | SequenceInputMode::HiddenDelayType => {}
                             }
-                            self.sequence_state = None;
-                            continue;
-                        }
-                    }
+                            log::debug!("2 sequence got {k:?}");
+                            log::info!("2 Current sequence: {:?}", state.sequence);
 
-                    // Check for and handle valid termination.
-                    if let HasValue((i, j)) = res {
-                        log::debug!("sequence complete; tapping fake key");
-                        match state.sequence_input_mode {
-                            SequenceInputMode::HiddenSuppressed
-                            | SequenceInputMode::HiddenDelayType => {}
-                            SequenceInputMode::VisibleBackspaced => {
-                                // Release all keys since they might modify the behaviour of
-                                // backspace into an undesirable behaviour, for example deleting
-                                // more characters than it should.
-                                layout.states.retain(|s| match s {
-                                    State::NormalKey { keycode, .. } => {
-                                        // Ignore the error, ugly to return it from retain, and
-                                        // this is very unlikely to happen anyway.
-                                        let _ = release_key(&mut self.kbd_out, keycode.into());
-                                        false
-                                    }
-                                    _ => true,
-                                });
-                                for k in state.sequence.iter() {
-                                    // Check for pressed modifiers and don't input backspaces for
-                                    // those since they don't output characters that can be
-                                    // backspaced.
-                                    let kc = OsCode::from(*k & MASK_KEYCODES);
-                                    match kc {
-                                        // Known bug: most non-characters-outputting keys are not
-                                        // listed. I'm too lazy to list them all. Just use
-                                        // character-outputting keys (and modifiers) in sequences
-                                        // please! Or switch to a different input mode? It doesn't
-                                        // really make sense to use non-typing characters other
-                                        // than modifiers does it? Since those would probably be
-                                        // further away from the home row, so why use them? If one
-                                        // desired to fix this, a shorter list of keys would
-                                        // probably be the list of keys that **do** output
-                                        // characters than those that don't.
-                                        OsCode::KEY_LEFTSHIFT
-                                        | OsCode::KEY_RIGHTSHIFT
-                                        | OsCode::KEY_LEFTMETA
-                                        | OsCode::KEY_RIGHTMETA
-                                        | OsCode::KEY_LEFTCTRL
-                                        | OsCode::KEY_RIGHTCTRL
-                                        | OsCode::KEY_LEFTALT
-                                        | OsCode::KEY_RIGHTALT => continue,
-                                        osc if matches!(
-                                            u16::from(osc),
-                                            KEY_IGNORE_MIN..=KEY_IGNORE_MAX
-                                        ) =>
-                                        {
-                                            continue
+                            use kanata_parser::sequences::*;
+                            use kanata_parser::trie::GetOrDescendentExistsResult::*;
+
+                            // Check for invalid sequence termination.
+                            let mut res = self.sequences.get_or_descendant_exists(&state.sequence);
+                            if res == NotInTrie {
+                                let is_invalid_termination = if self.sequence_backtrack_modcancel
+                                    && (pushed_into_seq & MASK_MODDED > 0)
+                                {
+                                    let mut no_valid_seqs = true;
+                                    // If applicable, check again with modifier bits unset.
+                                    for i in (0..state.sequence.len()).rev() {
+                                        // Note: proper bounds are immediately above.
+                                        // Can't use iter_mut due to borrowing issues.
+                                        state.sequence[i] &= MASK_KEYCODES;
+                                        res = self.sequences.get_or_descendant_exists(&state.sequence);
+                                        log::info!("2 Maybe found back-up sequence: {:?}", res);
+                                        if res != NotInTrie {
+                                            no_valid_seqs = false;
+                                            break;
                                         }
-                                        _ => {
-                                            self.kbd_out.press_key(OsCode::KEY_BACKSPACE)?;
-                                            self.kbd_out.release_key(OsCode::KEY_BACKSPACE)?;
+                                    }
+                                    no_valid_seqs
+                                } else {
+                                    true
+                                };
+                                if is_invalid_termination {
+                                    log::debug!("2 got invalid sequence; exiting sequence mode");
+                                    match state.sequence_input_mode {
+                                        SequenceInputMode::HiddenDelayType => {
+                                            for code in state.sequence.iter().copied() {
+                                                let code = code & MASK_KEYCODES;
+                                                if let Some(osc) = OsCode::from_u16(code) {
+                                                    // BUG: chorded_hidden_delay_type
+                                                    press_key(&mut self.kbd_out, osc)?;
+                                                    release_key(&mut self.kbd_out, osc)?;
+                                                }
+                                            }
+                                        }
+                                        SequenceInputMode::HiddenSuppressed
+                                        | SequenceInputMode::VisibleBackspaced => {}
+                                    }
+                                    self.sequence_state_2 = None;
+                                    continue;
+                                }
+                            }
+
+                            // Check for and handle valid termination.
+                            if let HasValue((i, j)) = res {
+                                log::debug!("2 sequence complete; tapping fake key");
+                                match state.sequence_input_mode {
+                                    SequenceInputMode::HiddenSuppressed
+                                    | SequenceInputMode::HiddenDelayType => {}
+                                    SequenceInputMode::VisibleBackspaced => {
+                                        // Release all keys since they might modify the behaviour of
+                                        // backspace into an undesirable behaviour, for example deleting
+                                        // more characters than it should.
+                                        layout.states.retain(|s| match s {
+                                            State::NormalKey { keycode, .. } => {
+                                                // Ignore the error, ugly to return it from retain, and
+                                                // this is very unlikely to happen anyway.
+                                                let _ = release_key(&mut self.kbd_out, keycode.into());
+                                                false
+                                            }
+                                            _ => true,
+                                        });
+                                        for k in state.sequence.iter() {
+                                            // Check for pressed modifiers and don't input backspaces for
+                                            // those since they don't output characters that can be
+                                            // backspaced.
+                                            let kc = OsCode::from(*k & MASK_KEYCODES);
+                                            match kc {
+                                                // Known bug: most non-characters-outputting keys are not
+                                                // listed. I'm too lazy to list them all. Just use
+                                                // character-outputting keys (and modifiers) in sequences
+                                                // please! Or switch to a different input mode? It doesn't
+                                                // really make sense to use non-typing characters other
+                                                // than modifiers does it? Since those would probably be
+                                                // further away from the home row, so why use them? If one
+                                                // desired to fix this, a shorter list of keys would
+                                                // probably be the list of keys that **do** output
+                                                // characters than those that don't.
+                                                OsCode::KEY_LEFTSHIFT
+                                                | OsCode::KEY_RIGHTSHIFT
+                                                | OsCode::KEY_LEFTMETA
+                                                | OsCode::KEY_RIGHTMETA
+                                                | OsCode::KEY_LEFTCTRL
+                                                | OsCode::KEY_RIGHTCTRL
+                                                | OsCode::KEY_LEFTALT
+                                                | OsCode::KEY_RIGHTALT => continue,
+                                                osc if matches!(
+                                                    u16::from(osc),
+                                                    KEY_IGNORE_MIN..=KEY_IGNORE_MAX
+                                                ) =>
+                                                {
+                                                    continue
+                                                }
+                                                _ => {
+                                                    self.kbd_out.press_key(OsCode::KEY_BACKSPACE)?;
+                                                    self.kbd_out.release_key(OsCode::KEY_BACKSPACE)?;
+                                                }
+                                            }
                                         }
                                     }
                                 }
+
+                                // Make sure to unpress any keys that were pressed as part of the sequence
+                                // so that the keyberon internal sequence mechanism can do press+unpress of
+                                // them.
+                                for k in state.sequence.iter() {
+                                    let kc = KeyCode::from(OsCode::from(*k & MASK_KEYCODES));
+                                    layout.states.retain(|s| match s {
+                                        State::NormalKey { keycode, .. } => kc != *keycode,
+                                        _ => true,
+                                    });
+                                }
+                                layout.event(Event::Press(i, j));
+                                layout.event(Event::Release(i, j));
+                                self.sequence_state_2 = None;
                             }
                         }
-
-                        // Make sure to unpress any keys that were pressed as part of the sequence
-                        // so that the keyberon internal sequence mechanism can do press+unpress of
-                        // them.
-                        for k in state.sequence.iter() {
-                            let kc = KeyCode::from(OsCode::from(*k & MASK_KEYCODES));
-                            layout.states.retain(|s| match s {
-                                State::NormalKey { keycode, .. } => kc != *keycode,
-                                _ => true,
-                            });
-                        }
-                        layout.event(Event::Press(i, j));
-                        layout.event(Event::Release(i, j));
-                        self.sequence_state = None;
                     }
+                } else {
+                    match &mut self.sequence_state_1 {
+                        None => {
+                            log::debug!("1 key press     {:?}", k);
+                            if let Err(e) = press_key(&mut self.kbd_out, k.into()) {
+                                bail!("1 failed to press key: {:?}", e);
+                            }
+                        }
+                        Some(state) => {
+                            state.ticks_until_timeout = state.sequence_timeout;
+
+                            let osc = OsCode::from(*k);
+
+                            let pushed_into_seq = {
+                                // Transform to OsCode and convert modifiers other than altgr/ralt
+                                // (same key different names) to the left version, since that's
+                                // how chords get transformed when building up sequences.
+                                let mut base = u16::from(match osc {
+                                    OsCode::KEY_RIGHTSHIFT => OsCode::KEY_LEFTSHIFT,
+                                    OsCode::KEY_RIGHTMETA => OsCode::KEY_LEFTMETA,
+                                    OsCode::KEY_RIGHTCTRL => OsCode::KEY_LEFTCTRL,
+                                    osc => osc,
+                                });
+                                // Modify the upper unused bits of the u16 to signify that the key
+                                // is activated alongside a modifier.
+                                for k in cur_keys.iter().copied() {
+                                    base |= mod_mask_for_keycode(k);
+                                }
+                                base
+                            };
+
+                            state.sequence.push(pushed_into_seq);
+                            match state.sequence_input_mode {
+                                SequenceInputMode::VisibleBackspaced => {
+                                    press_key(&mut self.kbd_out, osc)?;
+                                }
+                                SequenceInputMode::HiddenSuppressed
+                                | SequenceInputMode::HiddenDelayType => {}
+                            }
+                            log::debug!("1 sequence got {k:?}");
+                            log::info!("1 Current sequence: {:?}", state.sequence);
+
+                            use kanata_parser::sequences::*;
+                            use kanata_parser::trie::GetOrDescendentExistsResult::*;
+
+                            // Check for invalid sequence termination.
+                            let mut res = self.sequences.get_or_descendant_exists(&state.sequence);
+                            if res == NotInTrie {
+                                let is_invalid_termination = if self.sequence_backtrack_modcancel
+                                    && (pushed_into_seq & MASK_MODDED > 0)
+                                {
+                                    let mut no_valid_seqs = true;
+                                    // If applicable, check again with modifier bits unset.
+                                    for i in (0..state.sequence.len()).rev() {
+                                        // Note: proper bounds are immediately above.
+                                        // Can't use iter_mut due to borrowing issues.
+                                        state.sequence[i] &= MASK_KEYCODES;
+                                        res = self.sequences.get_or_descendant_exists(&state.sequence);
+                                        log::info!("1 Maybe found back-up sequence: {:?}", res);
+                                        if res != NotInTrie {
+                                            no_valid_seqs = false;
+                                            break;
+                                        }
+                                    }
+                                    no_valid_seqs
+                                } else {
+                                    true
+                                };
+                                if is_invalid_termination {
+                                    log::debug!("1 got invalid sequence; exiting sequence mode");
+                                    match state.sequence_input_mode {
+                                        SequenceInputMode::HiddenDelayType => {
+                                            for code in state.sequence.iter().copied() {
+                                                let code = code & MASK_KEYCODES;
+                                                if let Some(osc) = OsCode::from_u16(code) {
+                                                    // BUG: chorded_hidden_delay_type
+                                                    press_key(&mut self.kbd_out, osc)?;
+                                                    release_key(&mut self.kbd_out, osc)?;
+                                                }
+                                            }
+                                        }
+                                        SequenceInputMode::HiddenSuppressed
+                                        | SequenceInputMode::VisibleBackspaced => {}
+                                    }
+                                    self.sequence_state_1 = None;
+                                    continue;
+                                }
+                            }
+
+                            // Check for and handle valid termination.
+                            if let HasValue((i, j)) = res {
+                                log::debug!("1 sequence complete; tapping fake key");
+                                match state.sequence_input_mode {
+                                    SequenceInputMode::HiddenSuppressed
+                                    | SequenceInputMode::HiddenDelayType => {}
+                                    SequenceInputMode::VisibleBackspaced => {
+                                        // Release all keys since they might modify the behaviour of
+                                        // backspace into an undesirable behaviour, for example deleting
+                                        // more characters than it should.
+                                        layout.states.retain(|s| match s {
+                                            State::NormalKey { keycode, .. } => {
+                                                // Ignore the error, ugly to return it from retain, and
+                                                // this is very unlikely to happen anyway.
+                                                let _ = release_key(&mut self.kbd_out, keycode.into());
+                                                false
+                                            }
+                                            _ => true,
+                                        });
+                                        for k in state.sequence.iter() {
+                                            // Check for pressed modifiers and don't input backspaces for
+                                            // those since they don't output characters that can be
+                                            // backspaced.
+                                            let kc = OsCode::from(*k & MASK_KEYCODES);
+                                            match kc {
+                                                // Known bug: most non-characters-outputting keys are not
+                                                // listed. I'm too lazy to list them all. Just use
+                                                // character-outputting keys (and modifiers) in sequences
+                                                // please! Or switch to a different input mode? It doesn't
+                                                // really make sense to use non-typing characters other
+                                                // than modifiers does it? Since those would probably be
+                                                // further away from the home row, so why use them? If one
+                                                // desired to fix this, a shorter list of keys would
+                                                // probably be the list of keys that **do** output
+                                                // characters than those that don't.
+                                                OsCode::KEY_LEFTSHIFT
+                                                | OsCode::KEY_RIGHTSHIFT
+                                                | OsCode::KEY_LEFTMETA
+                                                | OsCode::KEY_RIGHTMETA
+                                                | OsCode::KEY_LEFTCTRL
+                                                | OsCode::KEY_RIGHTCTRL
+                                                | OsCode::KEY_LEFTALT
+                                                | OsCode::KEY_RIGHTALT => continue,
+                                                osc if matches!(
+                                                    u16::from(osc),
+                                                    KEY_IGNORE_MIN..=KEY_IGNORE_MAX
+                                                ) =>
+                                                {
+                                                    continue
+                                                }
+                                                _ => {
+                                                    self.kbd_out.press_key(OsCode::KEY_BACKSPACE)?;
+                                                    self.kbd_out.release_key(OsCode::KEY_BACKSPACE)?;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Make sure to unpress any keys that were pressed as part of the sequence
+                                // so that the keyberon internal sequence mechanism can do press+unpress of
+                                // them.
+                                for k in state.sequence.iter() {
+                                    let kc = KeyCode::from(OsCode::from(*k & MASK_KEYCODES));
+                                    layout.states.retain(|s| match s {
+                                        State::NormalKey { keycode, .. } => kc != *keycode,
+                                        _ => true,
+                                    });
+                                }
+                                layout.event(Event::Press(i, j));
+                                layout.event(Event::Release(i, j));
+                                self.sequence_state_1 = None;
+                            }
+                        }
+                    }
+                }
+            } else {
+                log::debug!("0 key press     {:?}", k);
+                if let Err(e) = press_key(&mut self.kbd_out, k.into()) {
+                    bail!("0 failed to press key: {:?}", e);
                 }
             }
         }
@@ -1431,25 +1639,49 @@ impl Kanata {
                             std::thread::sleep(time::Duration::from_millis((*delay).into()));
                         }
                         CustomAction::SequenceCancel => {
-                            if self.sequence_state.is_some() {
-                                log::debug!("exiting sequence");
-                                let state = self.sequence_state.as_ref().unwrap();
-                                cancel_sequence(state, &mut self.kbd_out)?;
-                                self.sequence_state = None;
+                            if RIGHT_HAND_KEYS.contains(&self.last_physical_keycode.unwrap()) {
+                                if self.sequence_state_2.is_some() {
+                                    log::debug!("exiting sequence");
+                                    let state = self.sequence_state_2.as_ref().unwrap();
+                                    cancel_sequence(state, &mut self.kbd_out)?;
+                                    self.sequence_state_2 = None;
+                                }
+                            } else {
+                                if self.sequence_state_1.is_some() {
+                                    log::debug!("exiting sequence");
+                                    let state = self.sequence_state_1.as_ref().unwrap();
+                                    cancel_sequence(state, &mut self.kbd_out)?;
+                                    self.sequence_state_1 = None;
+                                }
                             }
                         }
                         CustomAction::SequenceLeader(timeout, input_mode) => {
-                            if self.sequence_state.is_none()
-                                || self.sequence_state.as_ref().unwrap().sequence_input_mode
-                                    == SequenceInputMode::HiddenSuppressed
-                            {
-                                log::debug!("entering sequence mode");
-                                self.sequence_state = Some(SequenceState {
-                                    sequence: vec![],
-                                    sequence_input_mode: *input_mode,
-                                    ticks_until_timeout: *timeout,
-                                    sequence_timeout: *timeout,
-                                });
+                            if RIGHT_HAND_KEYS.contains(&self.last_physical_keycode.unwrap()) {
+                                if self.sequence_state_2.is_none()
+                                    || self.sequence_state_2.as_ref().unwrap().sequence_input_mode
+                                        == SequenceInputMode::HiddenSuppressed
+                                {
+                                    log::debug!("2 entering sequence mode");
+                                    self.sequence_state_2 = Some(SequenceState {
+                                        sequence: vec![],
+                                        sequence_input_mode: *input_mode,
+                                        ticks_until_timeout: *timeout,
+                                        sequence_timeout: *timeout,
+                                    });
+                                }
+                            } else {
+                                if self.sequence_state_1.is_none()
+                                    || self.sequence_state_1.as_ref().unwrap().sequence_input_mode
+                                        == SequenceInputMode::HiddenSuppressed
+                                {
+                                    log::debug!("1 entering sequence mode");
+                                    self.sequence_state_1 = Some(SequenceState {
+                                        sequence: vec![],
+                                        sequence_input_mode: *input_mode,
+                                        ticks_until_timeout: *timeout,
+                                        sequence_timeout: *timeout,
+                                    });
+                                }
                             }
                         }
                         CustomAction::Repeat => {
@@ -1647,7 +1879,7 @@ impl Kanata {
     }
 
     fn handle_repeat_actual(&mut self, event: &KeyEvent) -> Result<()> {
-        if self.sequence_state.is_some() {
+        if self.sequence_state_1.is_some() || self.sequence_state_2.is_some() {
             // While in sequence mode, don't send key repeats. I can't imagine it's a helpful use
             // case for someone trying to type in a sequence that they want to rely on key repeats
             // to finish a sequence. I suppose one might want to do repeat in order to try and
@@ -2063,7 +2295,8 @@ impl Kanata {
             && self.layout.b().active_sequences.is_empty()
             && self.layout.b().tap_dance_eager.is_none()
             && self.layout.b().action_queue.is_empty()
-            && self.sequence_state.is_none()
+            && self.sequence_state_1.is_none()
+            && self.sequence_state_2.is_none()
             && self.scroll_state.is_none()
             && self.hscroll_state.is_none()
             && self.move_mouse_state_vertical.is_none()
